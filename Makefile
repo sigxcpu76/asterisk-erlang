@@ -6,15 +6,15 @@ REBAR:=./rebar
 all: erl
 
 erl:
-	$(REBAR) -C rebar.config get-deps compile
-	@erl -make
+	$(REBAR) -C rebar.config -j 1 get-deps compile
+	@#@erl -make
 
 erldebug:
-	$(REBAR) -C rebar.debug.config 
+	$(REBAR) -C rebar.debug.config -j 1
 
 test: all
 	@mkdir -p .eunit
-	$(REBAR) skip_deps=true eunit
+	$(REBAR) -j 1 skip_deps=true eunit
 
 clean:
 	$(REBAR) clean

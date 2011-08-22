@@ -1,11 +1,12 @@
 {application, asterisk_erlang,
  [
   {description, "Asterisk Management Interface for Erlang"},
-  {vsn, "0.0.1"},
+  {vsn, git},
   {registered, []},
   {applications, [
                   kernel,
-                  stdlib
+                  stdlib,
+		  asterisk_erlang
                  ]},
   {mod, { asterisk_ami_connection, []}},
   {env, []}

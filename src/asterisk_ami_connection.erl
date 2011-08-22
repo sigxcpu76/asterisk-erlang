@@ -16,6 +16,10 @@
 	add_listener/2, connect/1, login/1
 	]).
 
+% tests
+-export([
+	connection_test/0
+]).
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
@@ -24,7 +28,7 @@
 -define(DEFAULT_TIMEOUT, 3000).
 
 -record(state, {
-	state = initial,
+	state,
 	host,
 	port,
 	user,
@@ -68,6 +72,7 @@ login(Connection) ->
 init([Host, Port, User, Password]) ->
 
 	{ok, #state{
+		state = initial,
 		host = Host,
 		port = Port,
 		user = User,
@@ -154,6 +159,6 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%--------------------------------------------------------------------
 
-test() ->
-	{ok, Connection} = start_link("188.240.89.251", "asterisk", "astnetmon1"),
+connection_test() ->
+	{ok, Connection} = start_link("asterisk-dev", "asterisk", "astnetmon1"),
 	ok = connect(Connection).
