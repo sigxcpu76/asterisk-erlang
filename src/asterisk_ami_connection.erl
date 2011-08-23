@@ -18,7 +18,8 @@
 		start_link/3, start_link/4,
 		add_listener/2, add_listener/3,
 		login/1,
-		ping/1
+		ping/1,
+		stop/1
 	]).
 
 % tests
@@ -29,8 +30,9 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
 -define(DEFAULT_AMI_PORT, 5038).
--define(TCP_OPTIONS, [binary, {packet, line}]).
+-define(DEFAULT_SOCKET_TIMEOUT, 3000).
 -define(DEFAULT_TIMEOUT, 3000).
+-define(TCP_OPTIONS, [binary, {packet, line}, {send_timeout, ?DEFAULT_SOCKET_TIMEOUT}]).
 -define(KVP_REGEX, "([a-zA-Z0-9]+):?\s*(.*)\r\n").
 -define(REGEX_OPTS,  {capture, [1,2], binary}).
 
@@ -61,6 +63,9 @@ start_link(Host, User, Password) ->
 
 start_link(Host, Port, User, Password) ->
 	gen_server:start_link(?MODULE, [Host, Port, User, Password], []).
+
+stop(Connection) ->
+	gen_server:cast(Connection, stop).
 
 add_listener(Connection, Pid) ->
 	add_listener(Connection, Pid, []).
@@ -95,7 +100,7 @@ init([Host, Port, User, Password]) ->
 		action_listeners = ae_ets_map:new(list_to_atom(lists:flatten([atom_to_list(action_listeners), "_", Host]))),
 		event_dict = ae_dict_map:new({host, Host}),
 		action_id = 0
-	}}.
+	}, ?DEFAULT_TIMEOUT}.
 
 %%--------------------------------------------------------------------
 %% Function: %% handle_call(Request, From, State) -> {reply, Reply, State} |
@@ -114,11 +119,11 @@ handle_call({add_listener, Pid, EventsList}, _From, State) ->
 	{reply, ok, State};
 
 handle_call(connect, {_Ref, ConnectWaitPid}, State) when State#state.state == initial ->
-	case gen_tcp:connect(State#state.host, State#state.port, ?TCP_OPTIONS, ?DEFAULT_TIMEOUT) of
+	case gen_tcp:connect(State#state.host, State#state.port, ?TCP_OPTIONS, ?DEFAULT_SOCKET_TIMEOUT) of
 		{ok, Socket} ->
-			{noreply, State#state{socket = Socket, state = connected, connect_wait_pid = ConnectWaitPid}};
+			{noreply, State#state{socket = Socket, state = connected, connect_wait_pid = ConnectWaitPid}, ?DEFAULT_TIMEOUT};
 		{error, Reason} ->
-			{reply, {error, Reason}, State}
+			{reply, {error, Reason}, State, ?DEFAULT_TIMEOUT}
 	end;
 
 handle_call(login, From, State) when State#state.state == initial ->
@@ -138,16 +143,17 @@ handle_call(login, From, State) when State#state.state == initial ->
 			NewStateWithSocket = NewState#state{socket = Socket},
 			{noreply, NewStateWithSocket};
 		{error, Reason} ->
-			{reply, {error, Reason}, State}
+			{reply, {error, Reason}, State, ?DEFAULT_TIMEOUT}
 	end;
 
 handle_call(ping, From, State) when State#state.state == receiving ->
 	NewState = send_raw_action("Ping", [], From, State),
-	{noreply, NewState};
+	{noreply, NewState, ?DEFAULT_TIMEOUT};
+
 
 handle_call(Request, From, State) ->
  	error_logger:error_msg("Unhandled call ~p from ~p in state ~p~n", [Request, From, State#state.state]),
- 	{reply, {error, invalidcommand}, State}.
+ 	{reply, {error, invalidcommand}, State, ?DEFAULT_TIMEOUT}.
 
 %%--------------------------------------------------------------------
 %% Function: handle_cast(Msg, State) -> {noreply, State} |
@@ -155,10 +161,12 @@ handle_call(Request, From, State) ->
 %% {stop, Reason, State}
 %% Description: Handling cast messages
 %%--------------------------------------------------------------------
+handle_cast(stop, State) ->
+	{stop, normal, State};
 
 handle_cast(Msg, State) ->
 	error_logger:error_msg("Unhandled cast ~p in State ~p", [Msg, State#state.state]),
-	{noreply, State}.
+	{noreply, State, ?DEFAULT_TIMEOUT}.
 
 %%--------------------------------------------------------------------
 %% Function: handle_info(Info, State) -> {noreply, State} |
@@ -166,11 +174,16 @@ handle_cast(Msg, State) ->
 %% {stop, Reason, State}
 %% Description: Handling all non call/cast messages
 %%--------------------------------------------------------------------
+handle_info(timeout, State) when State#state.state == receiving ->
+	% need to ping
+	NewState = send_raw_action_async("Ping", [], State),
+	{noreply, NewState, ?DEFAULT_TIMEOUT};
+
 handle_info({'DOWN', _Ref, process, Pid, _Reason}, State) ->
 	% one of our monitored processes exited
 	% if it was an event listener, remove it from list to avoid sending useless events
 	ae_ets_map:remove(State#state.event_listeners, Pid),
-	{noreply, State};
+	{noreply, State, ?DEFAULT_TIMEOUT};
 
 %% Socket events
 handle_info({tcp, Socket, <<"\r\n">>}, State) when Socket == State#state.socket ->
@@ -183,11 +196,11 @@ handle_info({tcp, Socket, <<"\r\n">>}, State) when Socket == State#state.socket 
 		_ActionId ->
 			NewState = handle_action_response(State)
 	end,
-	{noreply, NewState};
+	{noreply, NewState, ?DEFAULT_TIMEOUT};
 
 handle_info({tcp, Socket, Line}, State) when Socket == State#state.socket ->
 	NewState = handle_event_line(Line, State),
-	{noreply, NewState};
+	{noreply, NewState, ?DEFAULT_TIMEOUT};
 
 handle_info({tcp_closed,Socket}, State) when Socket == State#state.socket ->
 	{stop, disconnected, State};
@@ -196,7 +209,7 @@ handle_info({tcp_closed,Socket}, State) when Socket == State#state.socket ->
 
 handle_info(Info, State) ->
 	error_logger:error_msg("Received unhandled info ~p in state ~p", [Info, State#state.state]),
-	{noreply, State}.
+	{noreply, State, ?DEFAULT_TIMEOUT}.
 
 %%--------------------------------------------------------------------
 %% Function: terminate(Reason, State) -> void()
@@ -254,7 +267,9 @@ handle_action_response(State) when State#state.state == receiving ->
 	ActionId = list_to_integer(binary_to_list(ae_dict_map:get(EventDict, actionid))),
 	case ae_ets_map:get(State#state.action_listeners, ActionId) of
 		undefined ->
-			error_logger:error_msg("Undefined action listener for action id ~p", [ActionId]);
+			% error_logger:error_msg("Undefined action listener for action id ~p", [ActionId]);
+			% this was an async action
+			ok;
 		{Action, PidRef} ->
 			Response = parse_response(Action, EventDict),
 			%error_logger:info_msg("Sending reply to pid ~p: ~p", [PidRef, dict:to_list(EventDict)]),
@@ -266,6 +281,9 @@ handle_action_response(State) when State#state.state == receiving ->
 
 receives_event(_EventType, []) -> true;
 receives_event(EventType, EventsList) -> lists:member(EventType, EventsList).
+
+send_raw_action_async(Action, ActionData, State) when State#state.state == initial orelse State#state.state == receiving ->
+	send_raw_action(Action, ActionData, undefined, State).
 
 send_raw_action(Action, ActionData, From, State) when State#state.state == initial orelse State#state.state == receiving ->
 	ActionId = State#state.action_id,
@@ -285,7 +303,12 @@ send_raw_action(Action, ActionData, From, State) when State#state.state == initi
 	Socket = State#state.socket,
 	ok = gen_tcp:send(Socket, <<ActionPacket/binary, "\r\n">>),
 	% save the caller
-	ae_ets_map:put(State#state.action_listeners, ActionId, {Action, From}),
+	case From of
+		undefined ->
+			ok;
+		From ->
+			ae_ets_map:put(State#state.action_listeners, ActionId, {Action, From})
+	end,
 	State#state{action_id = ActionId + 1}.
 
 parse_response("Login", EventDict) ->
@@ -309,5 +332,8 @@ connection_test() ->
 	{ok, Connection} = test_init(),
 	LoginResponse = login(Connection),
 	error_logger:info_msg("~p~n", [LoginResponse]),
+	timer:sleep(10000),
 	PingResponse = ping(Connection),
-	error_logger:info_msg("~p~n", [PingResponse]).
+	error_logger:info_msg("~p~n", [PingResponse]),
+	stop(Connection).
+
