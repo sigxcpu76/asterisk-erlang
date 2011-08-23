@@ -9,11 +9,15 @@
 -module (asterisk_ami_connection).
 -behaviour(gen_server).
 
+-include("asterisk_ami.hrl").
+
 %% API
 
--export([
-	start_link/3, start_link/4,
-	add_listener/2, connect/1, login/1
+-export(
+	[
+		start_link/3, start_link/4,
+		add_listener/2, add_listener/3,
+		login/1
 	]).
 
 % tests
@@ -26,6 +30,8 @@
 -define(DEFAULT_AMI_PORT, 5038).
 -define(TCP_OPTIONS, [binary, {packet, line}]).
 -define(DEFAULT_TIMEOUT, 3000).
+-define(KVP_REGEX, "([a-zA-Z0-9]+):?\s*(.*)\r\n").
+-define(REGEX_OPTS,  {capture, [1,2], binary}).
 
 -record(state, {
 	state,
@@ -33,8 +39,13 @@
 	port,
 	user,
 	password,
+	ami_version,
 	event_listeners,
-	socket
+	socket,
+	event_dict,
+	action_id,
+	action_listeners,
+	connect_wait_pid
 }).
 
 %%====================================================================
@@ -51,13 +62,13 @@ start_link(Host, Port, User, Password) ->
 	gen_server:start_link(?MODULE, [Host, Port, User, Password], []).
 
 add_listener(Connection, Pid) ->
-	gen_server:call(Connection, {add_listener, Pid}).
+	add_listener(Connection, Pid, []).
 
-connect(Connection) ->
-	gen_server:call(Connection, connect).
+add_listener(Connection, Pid, EventsList) ->
+	gen_server:call(Connection, {add_listener, Pid, EventsList}).
 
 login(Connection) ->
-	gen_server:cast(Connection, login).
+	gen_server:call(Connection, login).
 
 %%====================================================================
 %% gen_server callbacks
@@ -70,14 +81,16 @@ login(Connection) ->
 %% Description: Initiates the server
 %%--------------------------------------------------------------------
 init([Host, Port, User, Password]) ->
-
 	{ok, #state{
 		state = initial,
 		host = Host,
 		port = Port,
 		user = User,
 		password = Password,
-		event_listeners = []
+		event_listeners = ae_ets_map:new(list_to_atom(lists:flatten([atom_to_list(event_listeners), "_", Host]))),
+		action_listeners = ae_ets_map:new(list_to_atom(lists:flatten([atom_to_list(action_listeners), "_", Host]))),
+		event_dict = ae_dict_map:new({host, Host}),
+		action_id = 0
 	}}.
 
 %%--------------------------------------------------------------------
@@ -90,25 +103,43 @@ init([Host, Port, User, Password]) ->
 %% Description: Handling call messages
 %%--------------------------------------------------------------------
 
-handle_call({add_listener, Pid}, _From, State) ->
+handle_call({add_listener, Pid, EventsList}, _From, State) ->
 	% monitor the pid to catch its death
 	erlang:monitor(process, Pid),
-	{reply, ok, State#state{event_listeners = [Pid] ++ State#state.event_listeners}};
+	ae_map_ets:put(State#state.event_listeners, Pid, EventsList),
+	{reply, ok, State};
 
-handle_call(connect, _From, State) when State#state.state == initial ->
+handle_call(connect, {_Ref, ConnectWaitPid}, State) when State#state.state == initial ->
 	case gen_tcp:connect(State#state.host, State#state.port, ?TCP_OPTIONS, ?DEFAULT_TIMEOUT) of
 		{ok, Socket} ->
-			Reply = ok,
-			NewState = State#state{socket = Socket, state = connected};
+			{noreply, State#state{socket = Socket, state = connected, connect_wait_pid = ConnectWaitPid}};
 		{error, Reason} ->
-			Reply = {error, Reason},
-			NewState = State
-	end,
-	{reply, Reply, NewState};
+			{reply, {error, Reason}, State}
+	end;
 
-handle_call(_Request, _From, State) ->
-	Reply = ok,
-	{reply, Reply, State}.
+handle_call(login, From, State) when State#state.state == initial ->
+	% first, connect
+	case gen_tcp:connect(State#state.host, State#state.port, ?TCP_OPTIONS, ?DEFAULT_TIMEOUT) of
+		{ok, Socket} ->
+			% save the listener to this action id
+			% ae_ets_map:put(State#state.action_listeners, State#state.action_id, Pid),
+			% perform login action
+			LoginAction = [
+				{"Action", "Login"},
+				{"Username", State#state.user},
+				{"Secret", State#state.password}
+			],
+			%error_logger:info_msg("Sending action ~p", [LoginAction]),
+			send_raw_action(LoginAction, From, State#state{socket = Socket}),
+			{noreply, State#state{socket = Socket}};
+		{error, Reason} ->
+			{reply, {error, Reason}, State}
+	end;
+
+handle_call(Request, From, State) ->
+ 	error_logger:error_msg("Unhandled call ~p from ~p in state ~p", [Request, From, State#state.state]),
+ 	Reply = ok,
+ 	{reply, Reply, State}.
 
 %%--------------------------------------------------------------------
 %% Function: handle_cast(Msg, State) -> {noreply, State} |
@@ -129,13 +160,34 @@ handle_cast(Msg, State) ->
 %%--------------------------------------------------------------------
 handle_info({'DOWN', _Ref, process, Pid, _Reason}, State) ->
 	% one of our monitored processes exited
-
 	% if it was an event listener, remove it from list to avoid sending useless events
-	EventListeners = [ X || X <- State#state.event_listeners, not X == Pid],
-	{noreply, State#state{event_listeners = EventListeners}};
+	ae_ets_map:remove(State#state.event_listeners, Pid),
+	{noreply, State};
+
+%% Socket events
+handle_info({tcp, Socket, <<"\r\n">>}, State) when Socket == State#state.socket ->
+	% we've received a full packet
+	% error_logger:info_msg("Received full packet: ~p", [dict:to_list(State#state.event_dict)]),
+	case ae_dict_map:get(State#state.event_dict, actionid) of
+		undefined ->
+			% standard event
+			NewState = handle_end_of_packet(State);
+		_ActionId ->
+			NewState = handle_action_response(State)
+	end,
+	{noreply, NewState};
+
+handle_info({tcp, Socket, Line}, State) when Socket == State#state.socket ->
+	NewState = handle_event_line(Line, State),
+	{noreply, NewState};
+
+handle_info({tcp_closed,Socket}, State) when Socket == State#state.socket ->
+	{stop, disconnected, State};
+
+%% End of socket events
 
 handle_info(Info, State) ->
-	error_logger:info_msg("Received unhandled info ~p in state ~p", [Info, State#state.state]),
+	error_logger:error_msg("Received unhandled info ~p in state ~p", [Info, State#state.state]),
 	{noreply, State}.
 
 %%--------------------------------------------------------------------
@@ -159,6 +211,87 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%--------------------------------------------------------------------
 
+
+handle_event_line(<<"Asterisk Call Manager/", AmiVersion/binary>>, State) when State#state.state == initial ->
+	% this must be the AMI version string
+	{match, [Version]} = re:run(AmiVersion, "(.*)\r\n", [{capture, [1], binary}]),
+	State#state{state = receiving, ami_version = Version};
+
+handle_event_line(LineWithCRLF, State) when State#state.state == receiving ->
+	% an event line
+	{match, [Key, Value]} = re:run(LineWithCRLF, "(.*)\\s*:\\s*(.*)\r\n", [{capture, [1,2], binary}]),
+	KeyAtom = list_to_atom(string:to_lower(binary_to_list(Key))),
+	NewEventDict = ae_dict_map:put(State#state.event_dict, KeyAtom, Value),
+	State#state{event_dict = NewEventDict}.
+
+handle_end_of_packet(State) when State#state.state == receiving ->
+	% add host to our event
+	EventDict = State#state.event_dict,
+	io:format("Sending event ~p~n", [dict:to_list(EventDict)]),
+	EventType = ae_dict_map:get(EventDict, event),
+	% we need to notify our listeners now based on their subscriptions
+	lists:foreach(
+		fun(X) ->
+			case receives_event(EventType, ae_ets_map:get(State#state.event_listeners, X)) of
+				true ->
+					X ! {asterisk_event, ae_dict_map:get(EventDict, event), EventDict};
+				false ->
+					ok
+			end
+		end, ae_ets_map:keys(State#state.event_listeners)),
+	State#state{event_dict = ae_dict_map:new({host, State#state.host})}.
+
+handle_action_response(State) when State#state.state == receiving ->
+	EventDict = State#state.event_dict,
+	ActionId = list_to_integer(binary_to_list(ae_dict_map:get(EventDict, actionid))),
+	Response = parse_response(EventDict),
+	case ae_ets_map:get(State#state.action_listeners, ActionId) of
+		undefined ->
+			error_logger:error_msg("Undefined action listener for action id ~p", [ActionId]);
+		PidRef ->
+			%error_logger:info_msg("Sending reply to pid ~p: ~p", [PidRef, dict:to_list(EventDict)]),
+			gen_server:reply(PidRef, Response)
+
+	end,
+	State#state{event_dict = ae_dict_map:new({host, State#state.host})}.
+
+
+receives_event(_EventType, []) -> true;
+receives_event(EventType, EventsList) -> lists:member(EventType, EventsList).
+
+send_raw_action(ActionList, From, State) when State#state.state == initial orelse State#state.state == receiving ->
+	ActionId = State#state.action_id,
+	ae_ets_map:put(State#state.action_listeners, ActionId, From),
+	ActionListWithActionId = [{"ActionID", list_to_binary(integer_to_list(ActionId))} | ActionList],
+	% build a big binary
+	ActionPacket = lists:foldl(
+		fun({K, V}, Acc) ->
+			BinK = ae_util:make_binary(K),
+			BinV = ae_util:make_binary(V),
+			<<Acc/binary, BinK/binary, ": ", BinV/binary, "\r\n">>
+		end, <<>>, ActionListWithActionId),
+	Socket = State#state.socket,
+	ok = gen_tcp:send(Socket, <<ActionPacket/binary, "\r\n">>),
+	State#state{action_id = ActionId + 1}.
+
+
+parse_response(EventDict) ->
+	case ae_dict_map:get(EventDict, response) of
+		<<"Success">> ->
+			{ok, ae_dict_map:get(EventDict, message)};
+		_Other ->
+			{error, ae_dict_map:get(EventDict, message)}
+	end.
+
+%% Tests
+
+
+test_init() ->
+	start_link("asterisk-dev", "asterisk", "astnetmon1").
+
 connection_test() ->
-	{ok, Connection} = start_link("asterisk-dev", "asterisk", "astnetmon1"),
-	ok = connect(Connection).
+	{ok, Connection} = test_init(),
+	Response = login(Connection),
+	error_logger:info_msg("~p~n", [Response]).
+
+
