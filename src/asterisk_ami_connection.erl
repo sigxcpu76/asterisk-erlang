@@ -17,7 +17,8 @@
 	[
 		start_link/3, start_link/4,
 		add_listener/2, add_listener/3,
-		login/1
+		login/1,
+		ping/1
 	]).
 
 % tests
@@ -69,6 +70,9 @@ add_listener(Connection, Pid, EventsList) ->
 
 login(Connection) ->
 	gen_server:call(Connection, login).
+
+ping(Connection) ->
+	gen_server:call(Connection, ping).
 
 %%====================================================================
 %% gen_server callbacks
@@ -124,22 +128,26 @@ handle_call(login, From, State) when State#state.state == initial ->
 			% save the listener to this action id
 			% ae_ets_map:put(State#state.action_listeners, State#state.action_id, Pid),
 			% perform login action
-			LoginAction = [
-				{"Action", "Login"},
+			LoginActionData = [
 				{"Username", State#state.user},
 				{"Secret", State#state.password}
 			],
 			%error_logger:info_msg("Sending action ~p", [LoginAction]),
-			send_raw_action(LoginAction, From, State#state{socket = Socket}),
-			{noreply, State#state{socket = Socket}};
+			NewState = send_raw_action("Login", LoginActionData, From, State#state{socket = Socket}),
+			% add socket to state
+			NewStateWithSocket = NewState#state{socket = Socket},
+			{noreply, NewStateWithSocket};
 		{error, Reason} ->
 			{reply, {error, Reason}, State}
 	end;
 
+handle_call(ping, From, State) when State#state.state == receiving ->
+	NewState = send_raw_action("Ping", [], From, State),
+	{noreply, NewState};
+
 handle_call(Request, From, State) ->
- 	error_logger:error_msg("Unhandled call ~p from ~p in state ~p", [Request, From, State#state.state]),
- 	Reply = ok,
- 	{reply, Reply, State}.
+ 	error_logger:error_msg("Unhandled call ~p from ~p in state ~p~n", [Request, From, State#state.state]),
+ 	{reply, {error, invalidcommand}, State}.
 
 %%--------------------------------------------------------------------
 %% Function: handle_cast(Msg, State) -> {noreply, State} |
@@ -244,11 +252,11 @@ handle_end_of_packet(State) when State#state.state == receiving ->
 handle_action_response(State) when State#state.state == receiving ->
 	EventDict = State#state.event_dict,
 	ActionId = list_to_integer(binary_to_list(ae_dict_map:get(EventDict, actionid))),
-	Response = parse_response(EventDict),
 	case ae_ets_map:get(State#state.action_listeners, ActionId) of
 		undefined ->
 			error_logger:error_msg("Undefined action listener for action id ~p", [ActionId]);
-		PidRef ->
+		{Action, PidRef} ->
+			Response = parse_response(Action, EventDict),
 			%error_logger:info_msg("Sending reply to pid ~p: ~p", [PidRef, dict:to_list(EventDict)]),
 			gen_server:reply(PidRef, Response)
 
@@ -259,29 +267,37 @@ handle_action_response(State) when State#state.state == receiving ->
 receives_event(_EventType, []) -> true;
 receives_event(EventType, EventsList) -> lists:member(EventType, EventsList).
 
-send_raw_action(ActionList, From, State) when State#state.state == initial orelse State#state.state == receiving ->
+send_raw_action(Action, ActionData, From, State) when State#state.state == initial orelse State#state.state == receiving ->
 	ActionId = State#state.action_id,
-	ae_ets_map:put(State#state.action_listeners, ActionId, From),
-	ActionListWithActionId = [{"ActionID", list_to_binary(integer_to_list(ActionId))} | ActionList],
-	% build a big binary
+	WithAddedActionIdAndAction = lists:flatten([
+		{"Action", Action},
+		{"ActionID", ActionId},
+		ActionData
+	]),
+
+	% build a big binary to send
 	ActionPacket = lists:foldl(
 		fun({K, V}, Acc) ->
 			BinK = ae_util:make_binary(K),
 			BinV = ae_util:make_binary(V),
 			<<Acc/binary, BinK/binary, ": ", BinV/binary, "\r\n">>
-		end, <<>>, ActionListWithActionId),
+		end, <<>>, WithAddedActionIdAndAction),
 	Socket = State#state.socket,
 	ok = gen_tcp:send(Socket, <<ActionPacket/binary, "\r\n">>),
+	% save the caller
+	ae_ets_map:put(State#state.action_listeners, ActionId, {Action, From}),
 	State#state{action_id = ActionId + 1}.
 
-
-parse_response(EventDict) ->
+parse_response("Login", EventDict) ->
 	case ae_dict_map:get(EventDict, response) of
 		<<"Success">> ->
 			{ok, ae_dict_map:get(EventDict, message)};
 		_Other ->
 			{error, ae_dict_map:get(EventDict, message)}
-	end.
+	end;
+
+parse_response("Ping", EventDict) ->
+	{ok, ae_dict_map:get(EventDict, timestamp)}.
 
 %% Tests
 
@@ -291,7 +307,7 @@ test_init() ->
 
 connection_test() ->
 	{ok, Connection} = test_init(),
-	Response = login(Connection),
-	error_logger:info_msg("~p~n", [Response]).
-
-
+	LoginResponse = login(Connection),
+	error_logger:info_msg("~p~n", [LoginResponse]),
+	PingResponse = ping(Connection),
+	error_logger:info_msg("~p~n", [PingResponse]).
