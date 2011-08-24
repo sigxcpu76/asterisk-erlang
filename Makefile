@@ -12,7 +12,7 @@ erl:
 erldebug:
 	$(REBAR) -C rebar.debug.config -j 1
 
-test: all
+test: clean all
 	@mkdir -p .eunit
 	$(REBAR) -j 1 skip_deps=true eunit
 

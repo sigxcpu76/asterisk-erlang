@@ -19,13 +19,10 @@
 		add_listener/2, add_listener/3,
 		login/1,
 		ping/1,
+		redirect/5, redirect/6,
 		stop/1
 	]).
 
-% tests
--export([
-	connection_test/0
-]).
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
@@ -78,6 +75,12 @@ login(Connection) ->
 
 ping(Connection) ->
 	gen_server:call(Connection, ping).
+
+redirect(Connection, Channel, Context, Exten, Priority) ->
+	gen_server:call(Connection, {redirect, Channel, undefined, Context, Exten, Priority}).
+
+redirect(Connection, Channel, ExtraChannel, Context, Exten, Priority) ->
+	gen_server:call(Connection, {redirect, Channel, ExtraChannel, Context, Exten, Priority}).
 
 %%====================================================================
 %% gen_server callbacks
@@ -150,6 +153,20 @@ handle_call(ping, From, State) when State#state.state == receiving ->
 	NewState = send_raw_action("Ping", [], From, State),
 	{noreply, NewState, ?DEFAULT_TIMEOUT};
 
+handle_call({redirect, Channel, ExtraChannel, Context, Exten, Priority}, From, State) when State#state.state == receiving ->
+	RedirectActionData = [
+		{"Channel", Channel},
+		{"Context", Context},
+		{"Exten", Exten},
+		{"Priority", Priority}
+	],
+	case ExtraChannel of
+		undefined ->
+			NewState = send_raw_action("Redirect", RedirectActionData, From, State);
+		ExtraChannel ->
+			NewState = send_raw_action("Redirect", [{"ExtraChannel", ExtraChannel}] ++ RedirectActionData, From, State)
+	end,
+	{noreply, NewState, ?DEFAULT_TIMEOUT};
 
 handle_call(Request, From, State) ->
  	error_logger:error_msg("Unhandled call ~p from ~p in state ~p~n", [Request, From, State#state.state]),
@@ -174,11 +191,6 @@ handle_cast(Msg, State) ->
 %% {stop, Reason, State}
 %% Description: Handling all non call/cast messages
 %%--------------------------------------------------------------------
-handle_info(timeout, State) when State#state.state == receiving ->
-	% need to ping
-	NewState = send_raw_action_async("Ping", [], State),
-	{noreply, NewState, ?DEFAULT_TIMEOUT};
-
 handle_info({'DOWN', _Ref, process, Pid, _Reason}, State) ->
 	% one of our monitored processes exited
 	% if it was an event listener, remove it from list to avoid sending useless events
@@ -206,6 +218,15 @@ handle_info({tcp_closed,Socket}, State) when Socket == State#state.socket ->
 	{stop, disconnected, State};
 
 %% End of socket events
+
+handle_info(timeout, State) when State#state.state == receiving ->
+	% need to ping
+	NewState = send_raw_action_async("Ping", [], State),
+	{noreply, NewState, ?DEFAULT_TIMEOUT};
+
+handle_info(timeout, State) when State#state.state == initial ->
+	% ignore
+	{noreply, State, ?DEFAULT_TIMEOUT};
 
 handle_info(Info, State) ->
 	error_logger:error_msg("Received unhandled info ~p in state ~p", [Info, State#state.state]),
@@ -267,7 +288,7 @@ handle_action_response(State) when State#state.state == receiving ->
 	ActionId = list_to_integer(binary_to_list(ae_dict_map:get(EventDict, actionid))),
 	case ae_ets_map:get(State#state.action_listeners, ActionId) of
 		undefined ->
-			% error_logger:error_msg("Undefined action listener for action id ~p", [ActionId]);
+			error_logger:error_msg("Undefined action listener for action id ~p", [ActionId]),
 			% this was an async action
 			ok;
 		{Action, PidRef} ->
@@ -311,29 +332,44 @@ send_raw_action(Action, ActionData, From, State) when State#state.state == initi
 	end,
 	State#state{action_id = ActionId + 1}.
 
-parse_response("Login", EventDict) ->
+
+%%--------------------------------------------------------------------
+%%% Action response parsers
+%%--------------------------------------------------------------------
+parse_response("Ping", EventDict) ->
+	{ok, ae_dict_map:get(EventDict, timestamp)};
+
+% generic parser
+parse_response(_Action, EventDict) ->
 	case ae_dict_map:get(EventDict, response) of
 		<<"Success">> ->
 			{ok, ae_dict_map:get(EventDict, message)};
 		_Other ->
 			{error, ae_dict_map:get(EventDict, message)}
-	end;
+	end.
 
-parse_response("Ping", EventDict) ->
-	{ok, ae_dict_map:get(EventDict, timestamp)}.
 
 %% Tests
 
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
 
-test_init() ->
-	start_link("asterisk-dev", "asterisk", "astnetmon1").
-
-connection_test() ->
-	{ok, Connection} = test_init(),
-	LoginResponse = login(Connection),
-	error_logger:info_msg("~p~n", [LoginResponse]),
-	timer:sleep(10000),
-	PingResponse = ping(Connection),
-	error_logger:info_msg("~p~n", [PingResponse]),
+login_successful_test() ->
+	% succesful login
+	{ok, Connection} = start_link("asterisk-dev", "asterisk", "astnetmon1"),
+	{ok, _} = login(Connection),
 	stop(Connection).
 
+login_failed_test() ->
+	% failed login
+	{ok, Connection2} = start_link("asterisk-dev", "astrisk", "asdasdads"),
+	{error, <<"Authentication failed">>} = login(Connection2),
+	stop(Connection2).
+
+ping_test() ->
+	% ping
+	{ok, Connection} = start_link("asterisk-dev", "asterisk", "astnetmon1"),
+	{ok, _} = login(Connection),
+	{ok, _} = ping(Connection),
+	stop(Connection).
+-endif.
