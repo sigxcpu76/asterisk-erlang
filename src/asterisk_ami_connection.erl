@@ -20,6 +20,7 @@
 		login/1,
 		ping/1,
 		redirect/5, redirect/6,
+		hangup/2,
 		stop/1
 	]).
 
@@ -30,7 +31,7 @@
 -define(DEFAULT_SOCKET_TIMEOUT, 3000).
 -define(DEFAULT_TIMEOUT, 3000).
 -define(TCP_OPTIONS, [binary, {packet, line}, {send_timeout, ?DEFAULT_SOCKET_TIMEOUT}]).
--define(KVP_REGEX, "([a-zA-Z0-9]+):?\s*(.*)\r\n").
+-define(KVP_REGEX, <<"([a-zA-Z0-9 ]+):?\s*(.*)\r\n">>).
 -define(REGEX_OPTS,  {capture, [1,2], binary}).
 
 -record(state, {
@@ -81,6 +82,10 @@ redirect(Connection, Channel, Context, Exten, Priority) ->
 
 redirect(Connection, Channel, ExtraChannel, Context, Exten, Priority) ->
 	gen_server:call(Connection, {redirect, Channel, ExtraChannel, Context, Exten, Priority}).
+
+hangup(Connection, Channel) ->
+	gen_server:call(Connection, {hangup, Channel}).
+
 
 %%====================================================================
 %% gen_server callbacks
@@ -168,6 +173,13 @@ handle_call({redirect, Channel, ExtraChannel, Context, Exten, Priority}, From, S
 	end,
 	{noreply, NewState, ?DEFAULT_TIMEOUT};
 
+handle_call({hangup, Channel}, From, State) when State#state.state == receiving ->
+	HangupActionData = [
+		{"Channel", Channel}
+	],
+	NewState = send_raw_action("Hangup", HangupActionData, From, State),
+	{noreply, NewState, ?DEFAULT_TIMEOUT};
+
 handle_call(Request, From, State) ->
  	error_logger:error_msg("Unhandled call ~p from ~p in state ~p~n", [Request, From, State#state.state]),
  	{reply, {error, invalidcommand}, State, ?DEFAULT_TIMEOUT}.
@@ -201,13 +213,15 @@ handle_info({'DOWN', _Ref, process, Pid, _Reason}, State) ->
 handle_info({tcp, Socket, <<"\r\n">>}, State) when Socket == State#state.socket ->
 	% we've received a full packet
 	% error_logger:info_msg("Received full packet: ~p", [dict:to_list(State#state.event_dict)]),
-	case ae_dict_map:get(State#state.event_dict, actionid) of
+	case ae_dict_map:get(State#state.event_dict, event) of
 		undefined ->
 			% standard event
-			NewState = handle_end_of_packet(State);
-		_ActionId ->
-			NewState = handle_action_response(State)
+			handle_action_response(State);
+		_EventType ->
+			handle_event(State)
 	end,
+	% reset packet
+	NewState = 	State#state{event_dict = ae_dict_map:new({host, State#state.host})},
 	{noreply, NewState, ?DEFAULT_TIMEOUT};
 
 handle_info({tcp, Socket, Line}, State) when Socket == State#state.socket ->
@@ -261,16 +275,16 @@ handle_event_line(<<"Asterisk Call Manager/", AmiVersion/binary>>, State) when S
 
 handle_event_line(LineWithCRLF, State) when State#state.state == receiving ->
 	% an event line
-	{match, [Key, Value]} = re:run(LineWithCRLF, "(.*)\\s*:\\s*(.*)\r\n", [{capture, [1,2], binary}]),
+	{match, [Key, Value]} = re:run(LineWithCRLF, ?KVP_REGEX, [{capture, [1,2], binary}]),
 	KeyAtom = list_to_atom(string:to_lower(binary_to_list(Key))),
 	NewEventDict = ae_dict_map:put(State#state.event_dict, KeyAtom, Value),
 	State#state{event_dict = NewEventDict}.
 
-handle_end_of_packet(State) when State#state.state == receiving ->
+handle_event(State) when State#state.state == receiving ->
 	% add host to our event
 	EventDict = State#state.event_dict,
-	io:format("Sending event ~p~n", [dict:to_list(EventDict)]),
 	EventType = ae_dict_map:get(EventDict, event),
+	io:format("Sending event ~p : ~p~n", [EventType, dict:to_list(EventDict)]),
 	% we need to notify our listeners now based on their subscriptions
 	lists:foreach(
 		fun(X) ->
@@ -280,24 +294,28 @@ handle_end_of_packet(State) when State#state.state == receiving ->
 				false ->
 					ok
 			end
-		end, ae_ets_map:keys(State#state.event_listeners)),
-	State#state{event_dict = ae_dict_map:new({host, State#state.host})}.
+		end, ae_ets_map:keys(State#state.event_listeners)).
 
 handle_action_response(State) when State#state.state == receiving ->
 	EventDict = State#state.event_dict,
-	ActionId = list_to_integer(binary_to_list(ae_dict_map:get(EventDict, actionid))),
-	case ae_ets_map:get(State#state.action_listeners, ActionId) of
+	case ae_dict_map:get(EventDict, actionid) of
 		undefined ->
-			error_logger:error_msg("Undefined action listener for action id ~p", [ActionId]),
-			% this was an async action
+			% no actionid. async action?
 			ok;
-		{Action, PidRef} ->
-			Response = parse_response(Action, EventDict),
-			%error_logger:info_msg("Sending reply to pid ~p: ~p", [PidRef, dict:to_list(EventDict)]),
-			gen_server:reply(PidRef, Response)
+		ActionId ->
+			ActionIdInteger = list_to_integer(binary_to_list(ActionId)),
+				case ae_ets_map:get(State#state.action_listeners, ActionIdInteger) of
+					undefined ->
+						error_logger:error_msg("Undefined action listener for action id ~p", [ActionId]),
+						% this was an async action
+						ok;
+					{Action, PidRef} ->
+						Response = parse_response(Action, EventDict),
+						%error_logger:info_msg("Sending reply to pid ~p: ~p", [PidRef, dict:to_list(EventDict)]),
+						gen_server:reply(PidRef, Response)
 
-	end,
-	State#state{event_dict = ae_dict_map:new({host, State#state.host})}.
+				end
+	end.
 
 
 receives_event(_EventType, []) -> true;
@@ -308,19 +326,21 @@ send_raw_action_async(Action, ActionData, State) when State#state.state == initi
 
 send_raw_action(Action, ActionData, From, State) when State#state.state == initial orelse State#state.state == receiving ->
 	ActionId = State#state.action_id,
-	WithAddedActionIdAndAction = lists:flatten([
-		{"Action", Action},
-		{"ActionID", ActionId},
-		ActionData
-	]),
-
+	ActionWithActionType = [{"Action", Action}] ++ ActionData,
+	case From of
+		undefined ->
+			% no action ID needed
+			ActionList = ActionWithActionType;
+		From ->
+			ActionList = [{"ActionID", ActionId}] ++ ActionWithActionType
+	end,
 	% build a big binary to send
 	ActionPacket = lists:foldl(
 		fun({K, V}, Acc) ->
 			BinK = ae_util:make_binary(K),
 			BinV = ae_util:make_binary(V),
 			<<Acc/binary, BinK/binary, ": ", BinV/binary, "\r\n">>
-		end, <<>>, WithAddedActionIdAndAction),
+		end, <<>>, ActionList),
 	Socket = State#state.socket,
 	ok = gen_tcp:send(Socket, <<ActionPacket/binary, "\r\n">>),
 	% save the caller
@@ -341,6 +361,7 @@ parse_response("Ping", EventDict) ->
 
 % generic parser
 parse_response(_Action, EventDict) ->
+	error_logger:info_msg("Parsing response ~p~n", [dict:to_list(EventDict)]),
 	case ae_dict_map:get(EventDict, response) of
 		<<"Success">> ->
 			{ok, ae_dict_map:get(EventDict, message)};
@@ -372,4 +393,10 @@ ping_test() ->
 	{ok, _} = login(Connection),
 	{ok, _} = ping(Connection),
 	stop(Connection).
+
+extra_test() ->
+	{ok, Connection} = start_link("asterisk-dev", "asterisk", "astnetmon1"),
+	login(Connection),
+	Response = redirect(Connection, "somechannel", "somecontext", "someextension", 1),
+	error_logger:info_msg("Got redirect response: ~p~n", [Response]).
 -endif.
