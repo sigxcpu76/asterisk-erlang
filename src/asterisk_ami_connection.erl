@@ -21,6 +21,7 @@
 		ping/1,
 		redirect/5, redirect/6,
 		hangup/2,
+		originate/6, originate/7,
 		stop/1
 	]).
 
@@ -82,6 +83,12 @@ redirect(Connection, Channel, Context, Exten, Priority) ->
 
 redirect(Connection, Channel, ExtraChannel, Context, Exten, Priority) ->
 	gen_server:call(Connection, {redirect, Channel, ExtraChannel, Context, Exten, Priority}).
+
+originate(Connection, Channel, Context, Exten, Priority, CallerId) ->
+	originate(Connection, Channel, Context, Exten, Priority, CallerId, []).
+
+originate(Connection, Channel, Context, Exten, Priority, CallerId, Variables) ->
+	gen_server:call(Connection, {originate, Channel, Context, Exten, Priority, CallerId, Variables}).
 
 hangup(Connection, Channel) ->
 	gen_server:call(Connection, {hangup, Channel}).
@@ -178,6 +185,20 @@ handle_call({hangup, Channel}, From, State) when State#state.state == receiving 
 		{"Channel", Channel}
 	],
 	NewState = send_raw_action("Hangup", HangupActionData, From, State),
+	{noreply, NewState, ?DEFAULT_TIMEOUT};
+
+handle_call({originate, Channel, Context, Exten, Priority, CallerId, Variables}, From, State) ->
+	VarString = ae_util:proplist_to_varstring(Variables),
+	OriginateActionData = [
+		{"Channel", Channel},
+		{"Context", Context},
+		{"Exten", Exten},
+		{"Priority", Priority},
+		{"CallerID", CallerId},
+		{"Variable", VarString},
+		{"Async", "false"}
+	],
+	NewState = send_raw_action("Originate", OriginateActionData, From, State),
 	{noreply, NewState, ?DEFAULT_TIMEOUT};
 
 handle_call(Request, From, State) ->
